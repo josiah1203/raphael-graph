@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 
 
 class InMemoryGraphClient:
-    """In-memory graph for tests and Neo4j fallback."""
+    """In-memory graph for unit tests only."""
 
     def __init__(self, uri: str = "bolt://localhost:7687") -> None:
         self.uri = uri
@@ -112,8 +112,8 @@ class InMemoryGraphClient:
         return None
 
 
-class Neo4jGraphClient(InMemoryGraphClient):
-    """Neo4j driver wrapper with real Cypher when driver is available."""
+class Neo4jGraphClient:
+    """Neo4j driver wrapper — no silent in-memory fallback."""
 
     def __init__(
         self,
@@ -121,7 +121,7 @@ class Neo4jGraphClient(InMemoryGraphClient):
         user: str = "neo4j",
         password: str = "password",
     ) -> None:
-        super().__init__(uri=uri)
+        self.uri = uri
         self.user = user
         self.password = password
         self._driver = None
@@ -130,18 +130,19 @@ class Neo4jGraphClient(InMemoryGraphClient):
 
             self._driver = GraphDatabase.driver(uri, auth=(user, password))
         except Exception:
-            logger.warning("Neo4j driver unavailable; using in-memory graph at %s", uri)
+            logger.warning("Neo4j driver unavailable at %s", uri)
+
+    def _require_driver(self) -> Any:
+        if not self._driver:
+            raise RuntimeError(f"Neo4j driver unavailable at {self.uri}")
+        return self._driver
 
     def _run(self, query: str, **params: Any) -> list[dict[str, Any]]:
-        if not self._driver:
-            return []
-        with self._driver.session() as session:
+        with self._require_driver().session() as session:
             result = session.run(query, **params)
             return [dict(record) for record in result]
 
     def upsert_node(self, node_id: str, labels: list[str], properties: dict[str, Any]) -> None:
-        if not self._driver:
-            return super().upsert_node(node_id, labels, properties)
         label_clause = ":".join(labels) if labels else "Node"
         props = {"id": node_id, **properties}
         self._run(
@@ -149,7 +150,6 @@ class Neo4jGraphClient(InMemoryGraphClient):
             id=node_id,
             props=props,
         )
-        super().upsert_node(node_id, labels, properties)
 
     def create_edge(
         self,
@@ -159,11 +159,7 @@ class Neo4jGraphClient(InMemoryGraphClient):
         properties: dict[str, Any],
         from_timestamp: str | None = None,
         to_timestamp: str | None = None,
-    ) -> None:
-        if not self._driver:
-            return super().create_edge(
-                from_id, to_id, edge_type, properties, from_timestamp, to_timestamp
-            )
+    ) -> bool:
         self._run(
             f"""
             MATCH (a {{id: $from_id}}), (b {{id: $to_id}})
@@ -178,21 +174,16 @@ class Neo4jGraphClient(InMemoryGraphClient):
                 "to_timestamp": to_timestamp,
             },
         )
-        super().create_edge(
-            from_id, to_id, edge_type, properties, from_timestamp, to_timestamp
-        )
+        return True
 
     def get_node(self, node_id: str) -> dict[str, Any] | None:
-        if self._driver:
-            rows = self._run("MATCH (n {id: $id}) RETURN n AS node", id=node_id)
-            if rows and rows[0].get("node"):
-                node = dict(rows[0]["node"])
-                return {"id": node.get("id", node_id), "properties": node}
-        return super().get_node(node_id)
+        rows = self._run("MATCH (n {id: $id}) RETURN n AS node", id=node_id)
+        if rows and rows[0].get("node"):
+            node = dict(rows[0]["node"])
+            return {"id": node.get("id", node_id), "properties": node}
+        return None
 
     def query_impact_set(self, start_node_id: str, depth: int = 5) -> set[str]:
-        if not self._driver:
-            return super().query_impact_set(start_node_id, depth=depth)
         rows = self._run(
             """
             MATCH (start {id: $start_id})-[*1..$depth]->(n)
@@ -205,9 +196,31 @@ class Neo4jGraphClient(InMemoryGraphClient):
         impact.update(row["id"] for row in rows if row.get("id"))
         return impact
 
+    def find_temporal_edges(self, start_ts: str, end_ts: str) -> list[dict[str, Any]]:
+        rows = self._run(
+            """
+            MATCH ()-[r]->()
+            WHERE r.from_timestamp <= $end_ts AND r.to_timestamp >= $start_ts
+            RETURN startNode(r).id AS from_id, endNode(r).id AS to_id,
+                   type(r) AS type, properties(r) AS properties,
+                   r.from_timestamp AS from_timestamp, r.to_timestamp AS to_timestamp
+            """,
+            start_ts=start_ts,
+            end_ts=end_ts,
+        )
+        return [
+            {
+                "from": row["from_id"],
+                "to": row["to_id"],
+                "type": row["type"],
+                "properties": row.get("properties") or {},
+                "from_timestamp": row.get("from_timestamp"),
+                "to_timestamp": row.get("to_timestamp"),
+            }
+            for row in rows
+        ]
+
     def list_edges(self, from_id: str | None = None, to_id: str | None = None) -> list[dict[str, Any]]:
-        if not self._driver:
-            return super().list_edges(from_id=from_id, to_id=to_id)
         query = "MATCH (a)-[r]->(b)"
         params: dict[str, Any] = {}
         clauses = []

@@ -1,75 +1,52 @@
-"""SQLite-backed knowledge graph store (default on-prem backend)."""
+"""PostgreSQL-backed knowledge graph store."""
 
 from __future__ import annotations
 
 import json
 import logging
-import sqlite3
-from pathlib import Path
 from typing import Any
-
-from raphael_audit.core.paths import calliope_home
 
 logger = logging.getLogger(__name__)
 
 
-class SqliteGraphClient:
-    """Persisted graph with temporal edge support."""
+class PostgresGraphClient:
+    """Persisted graph backed by shared Postgres migrations."""
 
-    def __init__(self, db_path: Path | None = None) -> None:
-        self.db_path = db_path or calliope_home() / "graph.db"
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        self._init_schema()
-        # Expose for test parity with InMemoryGraphClient
+    def __init__(self) -> None:
+        from raphael_contracts import db as rdb
+
+        rdb.ensure_migrations()
         self._nodes: dict[str, dict[str, Any]] = {}
         self._edges: list[dict[str, Any]] = []
         self._hydrate_cache()
 
-    def _init_schema(self) -> None:
-        self._conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS nodes (
-                node_id TEXT PRIMARY KEY,
-                labels TEXT NOT NULL,
-                properties TEXT NOT NULL
-            )
-            """
-        )
-        self._conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS edges (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                from_id TEXT NOT NULL,
-                to_id TEXT NOT NULL,
-                edge_type TEXT NOT NULL,
-                properties TEXT NOT NULL,
-                from_timestamp TEXT,
-                to_timestamp TEXT,
-                UNIQUE(from_id, to_id, edge_type)
-            )
-            """
-        )
-        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_from ON edges(from_id)")
-        self._conn.commit()
-
     def _hydrate_cache(self) -> None:
-        for row in self._conn.execute("SELECT node_id, labels, properties FROM nodes"):
+        from raphael_contracts.db import pg_fetchall
+
+        for row in pg_fetchall("SELECT node_id, labels, properties FROM graph_nodes"):
+            labels = row["labels"]
+            props = row["properties"]
+            if isinstance(labels, str):
+                labels = json.loads(labels)
+            if isinstance(props, str):
+                props = json.loads(props)
             self._nodes[row["node_id"]] = {
                 "id": row["node_id"],
-                "labels": json.loads(row["labels"]),
-                "properties": json.loads(row["properties"]),
+                "labels": labels,
+                "properties": props,
             }
-        for row in self._conn.execute(
-            "SELECT from_id, to_id, edge_type, properties, from_timestamp, to_timestamp FROM edges"
+        for row in pg_fetchall(
+            "SELECT from_id, to_id, edge_type, properties, from_timestamp, to_timestamp FROM graph_edges"
         ):
+            props = row["properties"]
+            if isinstance(props, str):
+                props = json.loads(props)
             self._edges.append(
                 {
                     "from": row["from_id"],
                     "to": row["to_id"],
                     "type": row["edge_type"],
-                    "properties": json.loads(row["properties"]),
+                    "properties": props,
                     "from_timestamp": row["from_timestamp"],
                     "to_timestamp": row["to_timestamp"],
                 }
@@ -79,14 +56,20 @@ class SqliteGraphClient:
         merged = dict(self._nodes.get(node_id, {}).get("properties", {}))
         merged.update(properties)
         self._nodes[node_id] = {"id": node_id, "labels": labels, "properties": merged}
-        self._conn.execute(
-            """
-            INSERT INTO nodes (node_id, labels, properties) VALUES (?, ?, ?)
-            ON CONFLICT(node_id) DO UPDATE SET labels = excluded.labels, properties = excluded.properties
-            """,
-            (node_id, json.dumps(labels), json.dumps(merged)),
-        )
-        self._conn.commit()
+        from raphael_contracts.db import connection
+
+        with connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO graph_nodes (node_id, labels, properties)
+                VALUES (%s, %s::jsonb, %s::jsonb)
+                ON CONFLICT (node_id) DO UPDATE SET
+                    labels = EXCLUDED.labels,
+                    properties = EXCLUDED.properties
+                """,
+                (node_id, json.dumps(labels), json.dumps(merged)),
+            )
+            conn.commit()
         logger.debug("Upserted graph node %s", node_id)
 
     def create_edge(
@@ -98,6 +81,7 @@ class SqliteGraphClient:
         from_timestamp: str | None = None,
         to_timestamp: str | None = None,
     ) -> bool:
+        """Insert edge; return False if an identical edge already exists."""
         for edge in self._edges:
             if edge["from"] == from_id and edge["to"] == to_id and edge["type"] == edge_type:
                 return False
@@ -110,11 +94,14 @@ class SqliteGraphClient:
             "to_timestamp": to_timestamp,
         }
         self._edges.append(edge)
-        try:
-            self._conn.execute(
+        from raphael_contracts.db import connection
+
+        with connection() as conn:
+            conn.execute(
                 """
-                INSERT INTO edges (from_id, to_id, edge_type, properties, from_timestamp, to_timestamp)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO graph_edges (from_id, to_id, edge_type, properties, from_timestamp, to_timestamp)
+                VALUES (%s, %s, %s, %s::jsonb, %s, %s)
+                ON CONFLICT (from_id, to_id, edge_type) DO NOTHING
                 """,
                 (
                     from_id,
@@ -125,9 +112,7 @@ class SqliteGraphClient:
                     to_timestamp,
                 ),
             )
-            self._conn.commit()
-        except sqlite3.IntegrityError:
-            return False
+            conn.commit()
         return True
 
     def get_node(self, node_id: str) -> dict[str, Any] | None:
@@ -170,4 +155,4 @@ class SqliteGraphClient:
         return edges
 
     def close(self) -> None:
-        self._conn.close()
+        return None

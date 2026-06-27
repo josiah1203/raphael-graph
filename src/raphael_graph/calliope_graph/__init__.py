@@ -6,6 +6,7 @@ import os
 from typing import Any, Protocol, runtime_checkable
 
 from raphael_graph.calliope_graph.neo4j_client import InMemoryGraphClient, Neo4jGraphClient
+from raphael_graph.calliope_graph.postgres_store import PostgresGraphClient
 from raphael_graph.calliope_graph.sqlite_store import SqliteGraphClient
 
 
@@ -33,15 +34,19 @@ def create_graph_client(
     neo4j_password: str | None = None,
     graph_db_path: Any = None,
 ) -> GraphClient:
-    uri = neo4j_uri or os.environ.get("NEO4J_URI")
+    uri = neo4j_uri or os.environ.get("RAPHAEL_NEO4J_URL") or os.environ.get("NEO4J_URI")
     user = neo4j_user or os.environ.get("NEO4J_USER", "neo4j")
     password = neo4j_password or os.environ.get("NEO4J_PASSWORD", "password")
     if graph_backend == "neo4j" or uri:
-        return Neo4jGraphClient(uri=uri or "bolt://localhost:7687", user=user, password=password)
+        client = Neo4jGraphClient(uri=uri or "bolt://localhost:7687", user=user, password=password)
+        if client.verify_connectivity():
+            return client
+    if os.environ.get("RAPHAEL_DATABASE_URL"):
+        return PostgresGraphClient()
     return SqliteGraphClient(db_path=graph_db_path)
 
 
-# Backward-compatible alias used in tests
+# Explicit test-only alias — not used as a production default.
 Neo4jClient = InMemoryGraphClient
 
 __all__ = [
@@ -49,6 +54,7 @@ __all__ = [
     "InMemoryGraphClient",
     "Neo4jClient",
     "Neo4jGraphClient",
+    "PostgresGraphClient",
     "SqliteGraphClient",
     "create_graph_client",
 ]
